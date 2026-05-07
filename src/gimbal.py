@@ -348,9 +348,9 @@ def main():
 
     # Initialize video capture
     print("Step 4: Connecting to IP camera...")
-    cap = cv2.VideoCapture(0)
-    # cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-    # cap.set(cv2.CAP_PROP_FPS, 30)
+    cap = cv2.VideoCapture(camera_url)
+    cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+    cap.set(cv2.CAP_PROP_FPS, 30)
 
     if not cap.isOpened():
         print(f"✗ Error: Could not connect to {camera_url}")
