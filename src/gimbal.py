@@ -21,12 +21,13 @@ except ImportError:
 camera_url = "http://10.155.209.253:8080/video"
 camera_url_two = "http://10.49.171.16:8080/video"
 camera_url_three = "http://10.238.255.61:8080/video"
+camera_url_four = "http://10.196.99.122:8080/video"
 # ===== STEPPER MOTOR GPIO PINS (BCM NUMBERING) =====
 # Using A4988 or DRV8825 stepper drivers
 
 # Pan Motor (Horizontal/X-axis)
 PAN_STEP_PIN = 17  # GPIO 17 (Physical pin 11)
-PAN_DIR_PIN = 27  # GPI
+PAN_DIR_PIN = 27  # GPIO 27 (Physical pin 13)
 PAN_ENABLE_PIN = 22  # GPIO 22 (Physical pin 15) - Optional
 
 # Tilt Motor (Vertical/Y-axis)
@@ -368,8 +369,15 @@ def main():
 
             if not cap.isOpened():
                 print(f"✗ Error: Could not connect to {camera_url_three}")
-                controller.cleanup()
-                return
+                print("Step 4: Connecting to IP camera...")
+                cap = cv2.VideoCapture(camera_url_four)
+                cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+                cap.set(cv2.CAP_PROP_FPS, 30)
+
+                if not cap.isOpened():
+                    print(f"✗ Error: Could not connect to {camera_url_four}")
+                    controller.cleanup()
+                    return
     print("✓ Connected to IP camera successfully!")
 
     # Display controls

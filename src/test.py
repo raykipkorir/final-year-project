@@ -15,7 +15,7 @@ TILT_ENABLE_PIN = 25
 # -----------------------------
 # CONFIG
 # -----------------------------
-STEPS = 10  # number of steps per move
+STEPS = 5  # number of steps per move
 DELAY = 0.001  # speed (lower = faster)
 
 # -----------------------------
