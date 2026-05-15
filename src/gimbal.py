@@ -18,7 +18,7 @@ except ImportError:
 # ===== CONFIGURATION =====
 
 # URL of the IP camera stream
-camera_url = "http://10.155.209.253:8080/video"
+camera_url = "http://10.126.1.142:8080/video"
 camera_url_two = "http://10.49.171.16:8080/video"
 camera_url_three = "http://10.238.255.61:8080/video"
 camera_url_four = "http://10.196.99.122:8080/video"
