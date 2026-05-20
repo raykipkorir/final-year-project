@@ -18,10 +18,8 @@ except ImportError:
 # ===== CONFIGURATION =====
 
 # URL of the IP camera stream
-camera_url = "http://10.126.1.142:8080/video"
-camera_url_two = "http://10.49.171.16:8080/video"
-camera_url_three = "http://10.238.255.61:8080/video"
-camera_url_four = "http://10.196.99.122:8080/video"
+camera_url = "http://192.168.100.132:8080/video"
+
 # ===== STEPPER MOTOR GPIO PINS (BCM NUMBERING) =====
 # Using A4988 or DRV8825 stepper drivers
 
@@ -37,7 +35,7 @@ TILT_ENABLE_PIN = 25  # GPIO 25 (Physical pin 22) - Optional
 
 # ===== STEPPER MOTOR SPECIFICATIONS =====
 STEPS_PER_REVOLUTION = 200  # NEMA 17: 1.8° per step
-MICROSTEPS = 32  # Set on driver (MS1, MS2, MS3 pins)
+MICROSTEPS = 16  # Set on driver (MS1, MS2, MS3 pins)
 TOTAL_STEPS = STEPS_PER_REVOLUTION * MICROSTEPS  # 3200 steps/revolution
 
 # ===== SPEED SETTINGS =====
@@ -163,13 +161,13 @@ class StepperMotor:
         if self.is_moving:
             return  # Skip if already moving
 
-        # def move():
-        self.is_moving = True
-        self.step(steps, direction, delay)
-        self.is_moving = False
+        def move():
+            self.is_moving = True
+            self.step(steps, direction, delay)
+            self.is_moving = False
 
-        # thread = threading.Thread(target=move, daemon=True)
-        # thread.start()
+        thread = threading.Thread(target=move, daemon=True)
+        thread.start()
 
     def goto_position(self, target_position, delay=STEP_DELAY):
         """Move to absolute position"""
@@ -240,7 +238,6 @@ class FaceTrackingController:
         )
 
         # Move asynchronously
-        print("Pan", steps, direction, delay)
         self.pan_motor.step_async(steps, direction, delay)
 
     def adjust_tilt(self, offset_y, frame_height):
@@ -269,7 +266,6 @@ class FaceTrackingController:
         )
 
         # Move asynchronously
-        print("Tilt", steps, direction, delay)
         self.tilt_motor.step_async(steps, direction, delay)
 
     def center(self):
@@ -341,12 +337,6 @@ def main():
     controller = FaceTrackingController()
     time.sleep(1)  # Let motors settle
 
-    # Auto-reset position counters on startup
-    print("Resetting position counters to zero...")
-    controller.pan_motor.reset_position()
-    controller.tilt_motor.reset_position()
-    print("✓ Position counters reset")
-
     # Initialize video capture
     print("Step 4: Connecting to IP camera...")
     cap = cv2.VideoCapture(camera_url)
@@ -355,30 +345,10 @@ def main():
 
     if not cap.isOpened():
         print(f"✗ Error: Could not connect to {camera_url}")
-        print("Step 4: Connecting to IP camera...")
-        cap = cv2.VideoCapture(camera_url_two)
-        cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-        cap.set(cv2.CAP_PROP_FPS, 30)
+        controller.cleanup()
+        return
 
-        if not cap.isOpened():
-            print(f"✗ Error: Could not connect to {camera_url_two}")
-            print("Step 4: Connecting to IP camera...")
-            cap = cv2.VideoCapture(camera_url_three)
-            cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-            cap.set(cv2.CAP_PROP_FPS, 30)
-
-            if not cap.isOpened():
-                print(f"✗ Error: Could not connect to {camera_url_three}")
-                print("Step 4: Connecting to IP camera...")
-                cap = cv2.VideoCapture(camera_url_four)
-                cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-                cap.set(cv2.CAP_PROP_FPS, 30)
-
-                if not cap.isOpened():
-                    print(f"✗ Error: Could not connect to {camera_url_four}")
-                    controller.cleanup()
-                    return
-    print("✓ Connected to IP camera successfully!")
+    print(f"✓ Connected to camera: {camera_url}")
 
     # Display controls
     print("\n" + "=" * 60)
@@ -394,11 +364,15 @@ def main():
 
     # Tracking variables
     frame_count = 0
-    skip_frames = 3
+    skip_frames = 2
     confidence_threshold = 0.6
     resize_width = 640
     smoothed_offset_x = 0
     smoothed_offset_y = 0
+
+    # Previous face tracking (for continuity)
+    previous_face_center = None  # Stores (x, y) of last detected face center
+    max_distance_threshold = 200  # Max pixels face can move between frames
 
     # FPS calculation
     fps_start_time = time.time()
@@ -462,7 +436,7 @@ def main():
 
             # Skip frames for performance
             if frame_count % (skip_frames + 1) != 0:
-                # cv2.imshow("Face Tracking - Raspberry Pi", frame)
+                cv2.imshow("Face Tracking - Raspberry Pi", frame)
                 continue
 
             # Resize for faster processing
@@ -483,14 +457,13 @@ def main():
                 print(f"Detection error: {e}")
                 continue
 
-            # Find best face
-            best_face = None
-            best_confidence = 0
+            # Collect all valid face detections
+            all_faces = []
 
             for i in range(detections.shape[2]):
                 confidence = detections[0, 0, i, 2]
 
-                if confidence > confidence_threshold and confidence > best_confidence:
+                if confidence > confidence_threshold:
                     box = detections[0, 0, i, 3:7] * np.array([w, h, w, h])
                     (x, y, x2, y2) = box.astype("int")
 
@@ -503,18 +476,99 @@ def main():
                     x2 = int(min(original_w, x2 * scale_x))
                     y2 = int(min(original_h, y2 * scale_y))
 
-                    best_face = (x, y, x2, y2)
-                    best_confidence = confidence
+                    face_width = x2 - x
+                    face_height = y2 - y
+                    face_center_x = x + face_width // 2
+                    face_center_y = y + face_height // 2
+
+                    all_faces.append(
+                        {
+                            "bbox": (x, y, x2, y2),
+                            "center": (face_center_x, face_center_y),
+                            "confidence": confidence,
+                            "width": face_width,
+                            "height": face_height,
+                        }
+                    )
+
+            # Select best face based on previous tracking
+            best_face = None
+
+            if len(all_faces) == 0:
+                # No faces detected
+                previous_face_center = None
+
+            elif len(all_faces) == 1:
+                # Only one face - track it
+                best_face = all_faces[0]
+                previous_face_center = best_face["center"]
+
+            else:
+                # Multiple faces detected - choose closest to previous position
+                if previous_face_center is not None:
+                    # Calculate distance from previous face position
+                    min_distance = float("inf")
+
+                    for face in all_faces:
+                        # Calculate Euclidean distance
+                        dx = face["center"][0] - previous_face_center[0]
+                        dy = face["center"][1] - previous_face_center[1]
+                        distance = np.sqrt(dx**2 + dy**2)
+
+                        if distance < min_distance:
+                            min_distance = distance
+                            best_face = face
+
+                    # If face moved too far, it might be a different person
+                    # Reset and choose most confident face
+                    if min_distance > max_distance_threshold:
+                        print(
+                            f"Face moved too far ({min_distance:.0f}px), selecting most confident face"
+                        )
+                        best_face = max(all_faces, key=lambda f: f["confidence"])
+
+                    previous_face_center = best_face["center"]
+
+                else:
+                    # No previous face - choose most confident
+                    best_face = max(all_faces, key=lambda f: f["confidence"])
+                    previous_face_center = best_face["center"]
+
+            # Draw all detected faces (for debugging)
+            for i, face in enumerate(all_faces):
+                x, y, x2, y2 = face["bbox"]
+                if face == best_face:
+                    # Best face - green box
+                    cv2.rectangle(frame, (x, y), (x2, y2), (0, 255, 0), 3)
+                    cv2.putText(
+                        frame,
+                        "TRACKING",
+                        (x, y - 10),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.6,
+                        (0, 255, 0),
+                        2,
+                    )
+                else:
+                    # Other faces - gray box
+                    cv2.rectangle(frame, (x, y), (x2, y2), (128, 128, 128), 1)
+                    cv2.putText(
+                        frame,
+                        "IGNORED",
+                        (x, y - 10),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.5,
+                        (128, 128, 128),
+                        1,
+                    )
 
             # Process best face
             if best_face:
-                x, y, x2, y2 = best_face
-                face_width = x2 - x
-                face_height = y2 - y
-
-                # Calculate face center
-                face_center_x = x + face_width // 2
-                face_center_y = y + face_height // 2
+                x, y, x2, y2 = best_face["bbox"]
+                face_width = best_face["width"]
+                face_height = best_face["height"]
+                face_center_x, face_center_y = best_face["center"]
+                best_confidence = best_face["confidence"]
 
                 # Calculate offset from frame center
                 offset_x = face_center_x - center_x
@@ -530,8 +584,7 @@ def main():
                     + offset_y * SMOOTHING_FACTOR
                 )
 
-                # Draw face rectangle
-                cv2.rectangle(frame, (x, y), (x2, y2), (0, 255, 0), 2)
+                # Draw face center point
                 cv2.circle(frame, (face_center_x, face_center_y), 8, (255, 0, 0), -1)
                 cv2.line(
                     frame,
@@ -543,11 +596,11 @@ def main():
 
                 # Get motor status
                 status = controller.get_status()
-                print(status)
+
                 # Display info
                 cv2.putText(
                     frame,
-                    f"Offset X: {smoothed_offset_x}px",
+                    f"Faces: {len(all_faces)} (Tracking 1)",
                     (10, 30),
                     cv2.FONT_HERSHEY_SIMPLEX,
                     0.6,
@@ -556,7 +609,7 @@ def main():
                 )
                 cv2.putText(
                     frame,
-                    f"Offset Y: {smoothed_offset_y}px",
+                    f"Offset X: {smoothed_offset_x}px",
                     (10, 60),
                     cv2.FONT_HERSHEY_SIMPLEX,
                     0.6,
@@ -565,7 +618,7 @@ def main():
                 )
                 cv2.putText(
                     frame,
-                    f"Pan: {status['pan']} steps",
+                    f"Offset Y: {smoothed_offset_y}px",
                     (10, 90),
                     cv2.FONT_HERSHEY_SIMPLEX,
                     0.6,
@@ -574,7 +627,7 @@ def main():
                 )
                 cv2.putText(
                     frame,
-                    f"Tilt: {status['tilt']} steps",
+                    f"Pan: {status['pan']} steps",
                     (10, 120),
                     cv2.FONT_HERSHEY_SIMPLEX,
                     0.6,
@@ -583,8 +636,17 @@ def main():
                 )
                 cv2.putText(
                     frame,
-                    f"FPS: {current_fps:.1f}",
+                    f"Tilt: {status['tilt']} steps",
                     (10, 150),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.6,
+                    (0, 255, 0),
+                    2,
+                )
+                cv2.putText(
+                    frame,
+                    f"FPS: {current_fps:.1f}",
+                    (10, 180),
                     cv2.FONT_HERSHEY_SIMPLEX,
                     0.6,
                     (255, 255, 0),
@@ -593,7 +655,7 @@ def main():
                 cv2.putText(
                     frame,
                     f"Confidence: {best_confidence:.1%}",
-                    (10, 180),
+                    (10, 210),
                     cv2.FONT_HERSHEY_SIMPLEX,
                     0.6,
                     (0, 255, 0),
@@ -610,7 +672,7 @@ def main():
                     cv2.putText(
                         frame,
                         "TRACKING",
-                        (10, 210),
+                        (10, 240),
                         cv2.FONT_HERSHEY_SIMPLEX,
                         0.7,
                         (0, 255, 255),
@@ -620,7 +682,7 @@ def main():
                     cv2.putText(
                         frame,
                         "CENTERED",
-                        (10, 210),
+                        (10, 240),
                         cv2.FONT_HERSHEY_SIMPLEX,
                         0.7,
                         (0, 255, 0),
@@ -646,7 +708,7 @@ def main():
                     2,
                 )
 
-            # cv2.imshow("Face Tracking - Raspberry Pi", frame)
+            cv2.imshow("Face Tracking - Raspberry Pi", frame)
 
     except KeyboardInterrupt:
         print("\n✗ Interrupted by user (Ctrl+C)")
