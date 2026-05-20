@@ -18,10 +18,8 @@ except ImportError:
 # ===== CONFIGURATION =====
 
 # URL of the IP camera stream
-camera_url = "http://10.126.1.142:8080/video"
-camera_url_two = "http://10.49.171.16:8080/video"
-camera_url_three = "http://10.238.255.61:8080/video"
-camera_url_four = "http://10.196.99.122:8080/video"
+# camera_url = "http://192.168.100.132:8080/video"
+camera_url_two = "http://10.179.72.36:8080/video"
 # ===== STEPPER MOTOR GPIO PINS (BCM NUMBERING) =====
 # Using A4988 or DRV8825 stepper drivers
 
@@ -37,18 +35,25 @@ TILT_ENABLE_PIN = 25  # GPIO 25 (Physical pin 22) - Optional
 
 # ===== STEPPER MOTOR SPECIFICATIONS =====
 STEPS_PER_REVOLUTION = 200  # NEMA 17: 1.8° per step
-MICROSTEPS = 32  # Set on driver (MS1, MS2, MS3 pins)
-TOTAL_STEPS = STEPS_PER_REVOLUTION * MICROSTEPS  # 3200 steps/revolution
+MICROSTEPS = 8  # OPTIMIZED: Changed from 16 to 8 for more torque at speed (Set on driver: MS1, MS2, MS3)
+TOTAL_STEPS = STEPS_PER_REVOLUTION * MICROSTEPS  # 1600 steps/revolution
 
-# ===== SPEED SETTINGS =====
-STEP_DELAY = 0.0005  # 500μs between steps (moderate speed)
-MAX_SPEED_DELAY = 0.0003  # 300μs (fastest)
-MIN_SPEED_DELAY = 0.001  # 1000μs (slowest)
+# ===== SPEED SETTINGS (OPTIMIZED FOR SMOOTH, FAST MOVEMENT) =====
+STEP_DELAY = 0.00012  # Base step period for small moves
+MAX_SPEED_DELAY = 0.00008  # Fastest step period for large corrections
+MIN_SPEED_DELAY = 0.00035  # Slowest step period for small corrections
+PULSE_HIGH_TIME = 0.00002  # High pulse width for stepper driver
+
+# ===== ACCELERATION RAMPING =====
+ENABLE_ACCELERATION = True  # Enable smooth acceleration/deceleration
+ACCEL_FACTOR = 0.94  # Speed up by 6% each step (0.94 = multiply delay by 0.94)
+DECEL_FACTOR = 1.06  # Slow down by 6% each step
 
 # ===== TRACKING PARAMETERS =====
 DEAD_ZONE = 30  # Pixels - ignore movements smaller than this
-SMOOTHING_FACTOR = 0.3  # 0.0-1.0 (lower = smoother)
-STEPS_PER_ADJUSTMENT = 15  # Steps to move per tracking update
+SMOOTHING_FACTOR = 0.45  # 0.0-1.0 (lower = smoother, higher = more responsive)
+STEPS_PER_ADJUSTMENT = 10  # Base step count per adjustment
+MAX_ADJUSTMENT_STEPS = 40  # Limit step size to prevent abrupt jumps
 
 # ===== DNN MODEL FILES =====
 model_file = "res10_300x300_ssd_iter_140000.caffemodel"
@@ -120,7 +125,7 @@ class StepperMotor:
 
     def step(self, steps, direction=1, delay=STEP_DELAY):
         """
-        Move motor by specified number of steps
+        Move motor by specified number of steps with acceleration ramping
 
         Args:
             steps: Number of steps to move
@@ -146,14 +151,37 @@ class StepperMotor:
             else:
                 GPIO.output(self.dir_pin, GPIO.LOW)  # Counter-clockwise
 
-            time.sleep(0.000001)  # Direction setup time (1μs)
+            time.sleep(0.000008)  # OPTIMIZED: Direction setup time increased to 8μs (was 1μs)
 
-            # Generate step pulses
-            for _ in range(abs(steps)):
-                GPIO.output(self.step_pin, GPIO.HIGH)
-                time.sleep(delay)
-                GPIO.output(self.step_pin, GPIO.LOW)
-                time.sleep(delay)
+            if ENABLE_ACCELERATION and steps > 5:
+                # Acceleration ramping for smooth movement
+                accel_steps = min(steps // 3, 50)  # Ramp up/down over ~33% of movement
+                decel_start = steps - accel_steps
+                current_delay = 0.0015  # Start slow and ramp into the target delay
+
+                for i in range(abs(steps)):
+                    # Acceleration phase
+                    if i < accel_steps:
+                        current_delay *= ACCEL_FACTOR  # Speed up
+                        current_delay = max(current_delay, delay)
+                    # Deceleration phase
+                    elif i >= decel_start:
+                        current_delay *= DECEL_FACTOR  # Slow down
+
+                    # Generate step pulse
+                    GPIO.output(self.step_pin, GPIO.HIGH)
+                    pulse_time = min(PULSE_HIGH_TIME, current_delay / 2)
+                    time.sleep(pulse_time)
+                    GPIO.output(self.step_pin, GPIO.LOW)
+                    time.sleep(max(0.0, current_delay - pulse_time))
+            else:
+                # Simple stepping without acceleration for small movements
+                for _ in range(abs(steps)):
+                    GPIO.output(self.step_pin, GPIO.HIGH)
+                    pulse_time = min(PULSE_HIGH_TIME, delay / 2)
+                    time.sleep(pulse_time)
+                    GPIO.output(self.step_pin, GPIO.LOW)
+                    time.sleep(max(0.0, delay - pulse_time))
 
             # Update position
             self.current_position += steps * direction
@@ -163,13 +191,13 @@ class StepperMotor:
         if self.is_moving:
             return  # Skip if already moving
 
-        # def move():
-        self.is_moving = True
-        self.step(steps, direction, delay)
-        self.is_moving = False
+        def move():
+            self.is_moving = True
+            self.step(steps, direction, delay)
+            self.is_moving = False
 
-        # thread = threading.Thread(target=move, daemon=True)
-        # thread.start()
+        thread = threading.Thread(target=move, daemon=True)
+        thread.start()
 
     def goto_position(self, target_position, delay=STEP_DELAY):
         """Move to absolute position"""
@@ -224,23 +252,20 @@ class FaceTrackingController:
             return  # Within dead zone, don't move
 
         # Calculate steps proportional to offset
-        # Larger offset = more steps
-        steps = int((abs(offset_x) / frame_width) * STEPS_PER_ADJUSTMENT * 2)
-        steps = max(1, min(steps, 100))  # Limit: 1-100 steps
+        # Larger offset = more steps, but keep motion smooth
+        steps = int((abs(offset_x) / frame_width) * STEPS_PER_ADJUSTMENT * 3)
+        steps = max(1, min(steps, MAX_ADJUSTMENT_STEPS))
 
         # Direction: positive offset means face is to the right
         # Motor should turn right (clockwise) to center it
         direction = 1 if offset_x > 0 else -1
 
         # Calculate speed based on offset magnitude
-        # Larger offset = faster movement
         speed_factor = min(abs(offset_x) / (frame_width / 2), 1.0)
         delay = MIN_SPEED_DELAY + (MAX_SPEED_DELAY - MIN_SPEED_DELAY) * (
             1 - speed_factor
         )
 
-        # Move asynchronously
-        print("Pan", steps, direction, delay)
         self.pan_motor.step_async(steps, direction, delay)
 
     def adjust_tilt(self, offset_y, frame_height):
@@ -255,8 +280,8 @@ class FaceTrackingController:
             return  # Within dead zone, don't move
 
         # Calculate steps
-        steps = int((abs(offset_y) / frame_height) * STEPS_PER_ADJUSTMENT * 2)
-        steps = max(1, min(steps, 100))  # Limit: 1-100 steps
+        steps = int((abs(offset_y) / frame_height) * STEPS_PER_ADJUSTMENT * 3)
+        steps = max(1, min(steps, MAX_ADJUSTMENT_STEPS))
 
         # Direction: positive offset means face is below center
         # Motor should tilt down to center it
@@ -268,8 +293,6 @@ class FaceTrackingController:
             1 - speed_factor
         )
 
-        # Move asynchronously
-        print("Tilt", steps, direction, delay)
         self.tilt_motor.step_async(steps, direction, delay)
 
     def center(self):
@@ -319,6 +342,7 @@ class FaceTrackingController:
 def main():
     print("\n" + "=" * 60)
     print("  FACE TRACKING SYSTEM - RASPBERRY PI + STEPPER MOTORS")
+    print("  [OPTIMIZED VERSION - SMOOTH & FAST MOVEMENT]")
     print("=" * 60 + "\n")
 
     # Download and load DNN model
@@ -341,44 +365,18 @@ def main():
     controller = FaceTrackingController()
     time.sleep(1)  # Let motors settle
 
-    # Auto-reset position counters on startup
-    print("Resetting position counters to zero...")
-    controller.pan_motor.reset_position()
-    controller.tilt_motor.reset_position()
-    print("✓ Position counters reset")
-
     # Initialize video capture
     print("Step 4: Connecting to IP camera...")
-    cap = cv2.VideoCapture(camera_url)
+    cap = cv2.VideoCapture(camera_url_two)
     cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
     cap.set(cv2.CAP_PROP_FPS, 30)
 
     if not cap.isOpened():
-        print(f"✗ Error: Could not connect to {camera_url}")
-        print("Step 4: Connecting to IP camera...")
-        cap = cv2.VideoCapture(camera_url_two)
-        cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-        cap.set(cv2.CAP_PROP_FPS, 30)
+        print(f"✗ Error: Could not connect to {camera_url_two}")
+        controller.cleanup()
+        return
 
-        if not cap.isOpened():
-            print(f"✗ Error: Could not connect to {camera_url_two}")
-            print("Step 4: Connecting to IP camera...")
-            cap = cv2.VideoCapture(camera_url_three)
-            cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-            cap.set(cv2.CAP_PROP_FPS, 30)
-
-            if not cap.isOpened():
-                print(f"✗ Error: Could not connect to {camera_url_three}")
-                print("Step 4: Connecting to IP camera...")
-                cap = cv2.VideoCapture(camera_url_four)
-                cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-                cap.set(cv2.CAP_PROP_FPS, 30)
-
-                if not cap.isOpened():
-                    print(f"✗ Error: Could not connect to {camera_url_four}")
-                    controller.cleanup()
-                    return
-    print("✓ Connected to IP camera successfully!")
+    print(f"✓ Connected to camera: {camera_url_two}")
 
     # Display controls
     print("\n" + "=" * 60)
@@ -394,11 +392,12 @@ def main():
 
     # Tracking variables
     frame_count = 0
-    skip_frames = 3
+    skip_frames = 1  # Process every 2nd frame for better responsiveness
     confidence_threshold = 0.6
-    resize_width = 640
+    resize_width = 320  # Lower image size for faster detection
     smoothed_offset_x = 0
     smoothed_offset_y = 0
+    last_face_center = None  # Keep previous face location for stable tracking
 
     # FPS calculation
     fps_start_time = time.time()
@@ -483,28 +482,56 @@ def main():
                 print(f"Detection error: {e}")
                 continue
 
-            # Find best face
+            # Find best face: prefer the one closest to the previous detection
             best_face = None
             best_confidence = 0
+            best_near_face = None
+            best_near_confidence = 0
+            closest_distance = float("inf")
 
             for i in range(detections.shape[2]):
                 confidence = detections[0, 0, i, 2]
 
-                if confidence > confidence_threshold and confidence > best_confidence:
-                    box = detections[0, 0, i, 3:7] * np.array([w, h, w, h])
-                    (x, y, x2, y2) = box.astype("int")
+                if confidence <= confidence_threshold:
+                    continue
 
-                    # Scale to original size
-                    scale_x = original_w / w
-                    scale_y = original_h / h
+                box = detections[0, 0, i, 3:7] * np.array([w, h, w, h])
+                (x, y, x2, y2) = box.astype("int")
 
-                    x = int(max(0, x * scale_x))
-                    y = int(max(0, y * scale_y))
-                    x2 = int(min(original_w, x2 * scale_x))
-                    y2 = int(min(original_h, y2 * scale_y))
+                # Scale to original size
+                scale_x = original_w / w
+                scale_y = original_h / h
 
+                x = int(max(0, x * scale_x))
+                y = int(max(0, y * scale_y))
+                x2 = int(min(original_w, x2 * scale_x))
+                y2 = int(min(original_h, y2 * scale_y))
+
+                face_center_x = x + (x2 - x) // 2
+                face_center_y = y + (y2 - y) // 2
+
+                if confidence > best_confidence:
                     best_face = (x, y, x2, y2)
                     best_confidence = confidence
+
+                if last_face_center is not None:
+                    dx = face_center_x - last_face_center[0]
+                    dy = face_center_y - last_face_center[1]
+                    distance_sq = dx * dx + dy * dy
+
+                    if distance_sq < closest_distance or (
+                        distance_sq == closest_distance
+                        and confidence > best_near_confidence
+                    ):
+                        closest_distance = distance_sq
+                        best_near_face = (x, y, x2, y2)
+                        best_near_confidence = confidence
+
+            if best_near_face is not None:
+                roi_radius = max(original_w, original_h) * 0.35
+                if closest_distance <= roi_radius * roi_radius:
+                    best_face = best_near_face
+                    best_confidence = best_near_confidence
 
             # Process best face
             if best_face:
@@ -515,6 +542,7 @@ def main():
                 # Calculate face center
                 face_center_x = x + face_width // 2
                 face_center_y = y + face_height // 2
+                last_face_center = (face_center_x, face_center_y)
 
                 # Calculate offset from frame center
                 offset_x = face_center_x - center_x
